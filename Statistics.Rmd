@@ -1,0 +1,346 @@
+---
+title: "Statistics"
+author: "Manel Mestre"
+date: "2024-06-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+library(rmdformats)
+
+## Global options
+options(max.print="75")
+opts_chunk$set(echo=TRUE,
+	             cache=FALSE,
+               prompt=FALSE,
+               tidy=TRUE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE)
+opts_knit$set(width=75)
+```
+
+```{r}
+message = FALSE
+installifnot <- function (pkg){
+  if (!require(pkg, character.only=T)){
+    BiocManager::install(pkg)
+  }
+}
+
+installifnot("edf")
+installifnot("here")
+installifnot("eegkit")
+installifnot("effectsize")
+installifnot("openxlsx")
+```
+
+```{r}
+message = FALSE
+library(edf)
+library(here)
+library(eegkit)
+library(effectsize)
+library(openxlsx)
+```
+
+```{r}
+
+chans<-c("Fp1", "Fp2", "F3", "F4", "F7", "F8", "T3", "T4", "C3", "C4", "T5", "T6",
+       "P3", "P4", "O1", "O2", "Fz", "Cz", "Pz")
+
+extract <- function(X, path){
+  path <- paste0(path, X)
+  df <- read.edf(path)
+  df<-as.data.frame(df$signal)
+  cols <- c(seq(2, 42, by = 2),39,41)
+  df <- df[, -cols]
+  df<-df[(1001:31000),]
+  colnames(df)<-chans
+  return(df)
+}
+```
+
+```{r}
+path <- here()
+path <- paste0(path, "/data/")
+file_list <- list.files(path)
+
+data_t <- list()
+for (i in file_list){
+  data_t[[i]] <- extract(i,path)
+}
+```
+
+```{r}
+#saveRDS(data_t,"data_t.rds")
+#data_t<-readRDS("data_t.rds")
+```
+
+```{r}
+fourier<-function(dats){
+  fft <- eegfft(dats, Fs = 500)
+  fft$band <- cut(fft$frequency, breaks = c(0.3, 4, 8, 13, 30, 100),
+                  labels = c("delta", "theta", "alpha", "beta", "gamma"))
+  return(fft)
+}
+
+entropy <- function(x) {
+  spec <- try(stats::spec.ar(na.contiguous(x), plot=FALSE, method='burg',
+                             n.freq = ceiling(length(x)/2 + 1)))
+  if ("try-error" %in% class(spec)) {
+    entropy <- NA
+  } else {
+    fx <- c(rev(spec$spec[-1]),spec$spec)/ length(x)
+    fx <- fx/sum(fx)
+    prior.fx = rep(1 / length(fx), length = length(fx))
+    prior.weight = 0.001
+    fx <- (1 - prior.weight) * fx + prior.weight * prior.fx
+    entropy <- pmin(1, -sum(fx * log(fx, base = length(x))))
+  }
+  return(c(entropy = entropy))
+}
+
+#Spectral entropy
+process_SE <- function(dats){
+  fft <- fourier(dats)
+  spectral_entropy_values <- tapply(fft$strength, fft$band, entropy)
+  return(spectral_entropy_values)
+}
+
+#Energy
+process_energy <- function(dats){
+  fft <- fourier(dats)
+  energy_values <- tapply(fft$strength, fft$band, function(x) sum(x^2))
+  return(energy_values)
+}
+
+#Mean values
+process_mean <- function(dats){
+  fft <- fourier(dats)
+  mean_values <- tapply(fft$strength, fft$band, mean)
+  return(mean_values)
+}
+
+#Median values
+process_median <- function(dats){
+  fft <- fourier(dats)
+  mean_values <- tapply(fft$strength, fft$band, median)
+  return(mean_values)
+}
+
+process<-function(fun,data){
+  nrow<-length(data)
+  ncol<-length(chans)*5
+  df <- data.frame(matrix(NA, nrow = nrow, ncol = ncol))
+  for (i in (1:length(data))){
+    v<- vector("numeric", length = 0)
+    for (j in chans){
+      p<-fun(data[[i]][[j]])
+      v<- c(v,p)
+    }
+    df[i, ]<-v
+  }
+  df$class<-rep(c(0, 1), length.out = nrow)
+  return(df)
+}
+```
+
+```{r}
+df_mean<-process(process_mean,data_t)
+df_median<-process(process_median,data_t)
+df_energy<-process(process_energy,data_t)
+df_SE<-process(process_SE,data_t)
+```
+
+```{r}
+#saveRDS(df_mean,"df_mean.rds")
+#saveRDS(df_median,"df_median.rds")
+#saveRDS(df_energy,"df_energy.rds")
+#saveRDS(df_SE,"df_SE.rds")
+```
+
+```{r}
+calc<-function(df,i){
+  
+  elem <- df[,i]
+  bac <- elem[seq(1, length(elem), 2)]
+  ari <- elem[seq(2, length(elem), 2)]
+  
+  #Check for normality
+  sw_b <- shapiro.test(bac)
+  sw_a <- shapiro.test(ari)
+  a<-sw_b$p.value
+  b<-sw_a$p.value
+ 
+  if (a > 0.05 & b > 0.05) {
+    t<-t.test(bac,ari, paired = TRUE)
+    p<-t$p.value
+  } else {
+    w<-wilcox.test(bac, ari)
+    p<-w$p.value
+  }
+  
+  eff_size<-rank_biserial(bac,ari, paired = TRUE)
+  e<-abs(round(eff_size$r_rank_biserial,2))
+
+  m_bac<-median(bac)
+  m_ari<-median(ari)
+  inc_med<-round((m_ari-m_bac)/m_bac,2)
+
+  vals<-list(p,e,inc_med)
+  return(vals)
+}
+
+visual<-function(df,title){
+  pvals<-data.frame()
+  for (i in 1:(length(df)-1)){
+    p<-calc(df,i)
+    pvals<-rbind(pvals,p)
+  }
+  colnames(pvals)<-c("bac","ari")
+  
+  plot(x= 1:95, pvals$bac, type = "p", pch = 16, col = "blue", xlab = "X",
+       ylab = "Y", main = title,ylim = c(0,1))
+  lines(x= 1:95, pvals$ari, type = "p", pch = 16, col = "green")
+  abline(h = 0.05, col = "red")
+}
+```
+
+```{r}
+#Normality
+visual(df_mean,"Mean")
+visual(df_median,"Median")
+visual(df_energy,"Energy")
+visual(df_SE,"Spectral Entropy")
+```
+
+```{r}
+contrast<-function(data){
+  pv<-numeric()
+  se<-numeric()
+  pi<-numeric()
+  for (i in 1:(length(data)-1)) {
+    cal<-calc(data,i)
+    pv<-c(pv,round(cal[[1]],4)) #p values
+    se<-c(se,cal[[2]]) #size effects
+    pi<-c(pi,cal[[3]]) #increase
+  }
+  df<-as.data.frame(pv)
+  df$se<-se
+  df$pi<-pi
+  colnames(df)<-c("p_val","eff_size","increment")
+  return(df)
+}
+```
+
+```{r}
+sheet<-function(data){
+  df<-contrast(data)
+  sheet<-data.frame()
+  j<-1
+  for (i in chans){
+    d<-as.numeric(df[j,])
+    t<-as.numeric(df[j+1,])
+    a<-as.numeric(df[j+2,])
+    b<-as.numeric(df[j+3,])
+    g<-as.numeric(df[j+4,])
+    v<-c(d,t,a,b,g)
+    sheet<-rbind(sheet,v)
+    j<-j+5
+  }  
+  sheet$chans<-chans  
+  colnames(sheet)<-c("D p-val","D eff_size", "D incr","T p-val","T eff_size", "T incr",
+                 "A p-val","A eff_size", "A incr","B p-val","B eff_size", "B incr",
+                 "G p-val","G eff_size", "G incr","chans")
+  return(sheet)
+}
+
+save_data<-function(df,sheet){
+  data<-sheet(df)
+  addWorksheet(wb, sheetName = sheet)
+  writeData(wb, sheet = sheet, data)
+}
+
+wb <- createWorkbook()
+save_data(df_mean,"Mean values")
+save_data(df_median,"Median values")
+save_data(df_energy,"Energy values")
+save_data(df_SE,"Entropy values")
+saveWorkbook(wb, file = "Results.xlsx", overwrite = TRUE)
+```
+
+Getting coordinates and drawing EEG caps:
+
+```{r}
+get_coords<-function(data){
+  df<-contrast(data)
+  x<-numeric()
+  for (i in 1:nrow(df)){ #Defining threshold points
+    if (df$p_val[i]<0.05 & df$eff_size[i]>0.3){
+      x<-c(x,df$increment[i])
+    }
+    else {x<-c(x,0)}
+  }
+  j<-1
+  delta<-numeric()
+  theta<-numeric()
+  alpha<-numeric()
+  beta<-numeric()
+  gamma<-numeric()
+  for (i in chans){
+    delta<-c(delta,x[j])
+    theta<-c(theta,x[j+1])
+    alpha<-c(alpha,x[j+2])
+    beta<-c(beta,x[j+3])
+    gamma<-c(gamma,x[j+4])
+    j<-j+5
+  }  
+  f<-data.frame(delta,theta, alpha, beta, gamma,chans)
+  return(f)
+}
+
+coord_energy<-get_coords(df_energy)
+coord_median<-get_coords(df_median)
+coord_mean<-get_coords(df_mean)
+coord_SE<-get_coords(df_SE)
+```
+
+```{r}
+data(eegcoord)
+b<-c("FP1", "FP2", "F3", "F4", "F7", "F8", "T7", "T8", "C3", "C4", "P7", "P8", "P3", "P4", "O1", "O2", "FZ", "CZ", "PZ")
+eegcoord <- eegcoord[rownames(eegcoord) %in% b,,drop = FALSE]
+cidx <- match(b,rownames(eegcoord))
+eeg_draw <- function(data, wave) {
+  eegspace(eegcoord[cidx, 4:5], get(wave, envir = as.environment(data)),
+           barloc = "left", vlim = c(-1, 1))
+}
+eeg_draw_SE <- function(data, wave) {
+  eegspace(eegcoord[cidx, 4:5], get(wave, envir = as.environment(data)),
+           barloc = "left", vlim = c(-0.1, 0.1))
+}
+```
+
+```{r}
+waves<-c("delta","theta","alpha","beta","gamma")
+sets<-c(coord_mean,"coord_median","coord_energy","coord_SE")
+
+draw_set<-function(set){
+  for (i in waves){
+    eeg_draw(set, i)
+  }
+}
+draw_set_SE<-function(set){
+  for (i in waves){
+    eeg_draw_SE(set, i)
+  }
+}
+```
+
+```{r}
+draw_set(coord_mean)
+draw_set(coord_median)
+draw_set(coord_energy)
+draw_set_SE(coord_SE)
+```

@@ -1,0 +1,333 @@
+---
+title: "Machine Learning"
+author: "Manel Mestre"
+date: "2024-06-15"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+library(rmdformats)
+
+## Global options
+options(max.print="75")
+opts_chunk$set(echo=TRUE,
+	             cache=FALSE,
+               prompt=FALSE,
+               tidy=TRUE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE)
+opts_knit$set(width=75)
+```
+
+```{r}
+message = FALSE
+installifnot <- function (pkg){
+  if (!require(pkg, character.only=T)){
+    BiocManager::install(pkg)
+  }
+}
+
+installifnot("here")
+installifnot("caret")
+installifnot("edf")
+installifnot("eegkit")
+installifnot("openxlsx")
+```
+
+```{r}
+message = FALSE
+library(here)
+library(caret)
+library(edf)
+library(eegkit)
+library(openxlsx)
+```
+
+```{r}
+
+chans<-c("Fp1", "Fp2", "F3", "F4", "F7", "F8", "T3", "T4", "C3", "C4", "T5", "T6",
+       "P3", "P4", "O1", "O2", "Fz", "Cz", "Pz")
+
+extract <- function(X, path){
+  path <- paste0(path, X)
+  df <- read.edf(path)
+  df<-as.data.frame(df$signal)
+  cols <- c(seq(2, 42, by = 2),39,41)
+  df <- df[, -cols]
+  colnames(df)<-chans
+  df1<-df[(1001:8500),]
+  df2<-df[(8501:16000),]
+  df3<-df[(16001:23500),]
+  df4<-df[(23501:31000),]
+  dfT<-list(df1,df2,df3,df4)
+  return(dfT)
+}
+```
+
+```{r}
+path <- here()
+path <- paste0(path, "/data/")
+file_list <- list.files(path)
+
+dfm <- list()
+for (i in file_list){
+  dfm <- c(dfm,extract(i,path))
+}
+```
+
+```{r}
+#saveRDS(dfm,"dfm.rds")
+#dfm<-readRDS("dfm.rds")
+```
+
+```{r}
+fourier<-function(dats){
+  fft <- eegfft(dats, Fs = 500)
+  fft$band <- cut(fft$frequency, breaks = c(0.3, 4, 8, 13, 30, 100),
+                  labels = c("delta", "theta", "alpha", "beta", "gamma"))
+  return(fft)
+}
+
+entropy <- function(x) {
+  spec <- try(stats::spec.ar(na.contiguous(x), plot=FALSE, method='burg',
+                             n.freq = ceiling(length(x)/2 + 1)))
+  if ("try-error" %in% class(spec)) {
+    entropy <- NA
+  } else {
+    fx <- c(rev(spec$spec[-1]),spec$spec)/ length(x)
+    fx <- fx/sum(fx)
+    prior.fx = rep(1 / length(fx), length = length(fx))
+    prior.weight = 0.001
+    fx <- (1 - prior.weight) * fx + prior.weight * prior.fx
+    entropy <- pmin(1, -sum(fx * log(fx, base = length(x))))
+  }
+  return(c(entropy = entropy))
+}
+
+#Spectral entropy
+process_SE <- function(dats){
+  fft <- fourier(dats)
+  spectral_entropy_values <- tapply(fft$strength, fft$band, entropy)
+  return(spectral_entropy_values)
+}
+
+#Energy
+process_energy <- function(dats){
+  fft <- fourier(dats)
+  energy_values <- tapply(fft$strength, fft$band, function(x) sum(x^2))
+  return(energy_values)
+}
+
+#Mean values
+process_mean <- function(dats){
+  fft <- fourier(dats)
+  mean_values <- tapply(fft$strength, fft$band, mean)
+  return(mean_values)
+}
+
+#Median values
+process_median <- function(dats){
+  fft <- fourier(dats)
+  mean_values <- tapply(fft$strength, fft$band, median)
+  return(mean_values)
+}
+
+subject<-read.csv("subject-info.csv")
+gender <- ifelse(subject$Gender == "F", 1, 0)
+sex<-numeric()
+for (i in gender){
+  sex<-c(sex,rep(i, 8))
+}
+
+quality <- subject$Count.quality
+qual<-numeric()
+for (i in quality){
+  qual<-c(qual,rep(i, 8))
+}
+
+task<-rep(c(0,0,0,0,1,1,1,1), length.out = nrow<-length(dfm))
+
+process<-function(fun,data){
+  ncol<-length(chans)*5
+  df <- data.frame(matrix(NA, nrow = nrow, ncol = ncol))
+  for (i in (1:length(data))){
+    v<- vector("numeric", length = 0)
+    for (j in chans){
+      p<-fun(data[[i]][[j]])
+      v<- c(v,p)
+    }
+    df[i, ]<-v
+  }
+  return(df)
+}
+```
+
+```{r}
+dfm_mean<-process(process_mean,dfm)
+dfm_median<-process(process_median,dfm)
+dfm_energy<-process(process_energy,dfm)
+dfm_SE<-process(process_SE,dfm)
+```
+
+```{r}
+
+normalize<-function(df){
+  process <- preProcess(as.data.frame(df), method=c("range"))
+  data<-predict(process, as.data.frame(df))
+  data$class<-as.factor(df$class) #task
+  return(data)
+}
+
+ML<-function(data){
+  set.seed(123)
+  
+  index <- rep(1:(nrow(data)/4), each = 4)
+  groups <- unique(index)
+  shuffled <- sample(groups)
+  
+  num<-round(length(groups)*0.2)
+  ind_test <- shuffled[1:num]
+  ind_train <- shuffled[(num + 1):length(groups)]
+  
+  testing <- data[index %in% ind_test, ]
+  training <- data[index %in% ind_train, ]
+  
+  values <- function(name, n) {
+    pred <- model %>% predict(testing)
+    cm<-confusionMatrix(testing$class, pred)
+    matrix[[paste(n)]] <- cm
+    acc<-as.numeric(cm$overall["Accuracy"])
+    pval<-as.numeric(cm$overall["AccuracyPValue"])
+    kap<- as.numeric(cm$overall["Kappa"])
+    n_mod <- c(name, acc, pval, kap)
+    return(n_mod)
+  }
+  
+  #Models 1 to 5 corresponding to k-NN
+  matrix <- list()
+  n=0
+  for (i in c(1,3,5,7,11)){
+    model <- train(class ~., data = training, method = "knn", 
+                 trControl = trainControl("cv", number = 10),
+                 tuneGrid = data.frame(k = i))
+    pred <- model %>% predict(testing)
+    cm<-confusionMatrix(testing$class, pred)
+    n=n+1
+    matrix[[paste(n)]] <- cm
+  }
+  
+  metrics<-data.frame(Model=c("k=1","k=3","k=5","k=7","k=11"))
+  for (i in (1:5)){
+    metrics$accuracy[i]<-matrix[[i]]$overall["Accuracy"]
+    metrics$p_value[i]<-matrix[[i]]$overall["AccuracyPValue"]
+    metrics$kappa[i]<-matrix[[i]]$overall["Kappa"]
+  }
+  
+  #Model 6 - Naive Bayes without Laplace
+  model <- train(class ~., data = training, method = "naive_bayes", 
+                 trControl = trainControl("cv", number = 10))
+  n_mod<-values("Naive Bayes without Laplace",6)
+  metrics <- rbind(metrics, n_mod)
+  
+  #Model 7 - Naive Bayes with Laplace
+  grid <- expand.grid(usekernel = c(TRUE, FALSE),
+                         laplace = c(0, 0.5, 1), 
+                         adjust = c(0.75, 1, 1.25, 1.5))
+  
+  model <- train(class ~., data = training, method = "naive_bayes",
+                 trControl = trainControl("cv", number = 10),
+                 tuneGrid = grid)
+  n_mod<-values("Naive Bayes with Laplace",7)
+  metrics <- rbind(metrics, n_mod)
+  
+  #Model 8 - Neural Network one hidden layer of 10 nodes
+  model <- train(class ~., data = training, method = "nnet", 
+                 trControl = trainControl("cv", number = 4),
+                 tuneGrid = expand.grid(size = 4, decay = 0),
+                 trace = FALSE)
+  n_mod<-values("Neural Network 1 hidden",8)
+  metrics <- rbind(metrics, n_mod)
+  
+  #Model 9 - Neural Network with 2 hidden layers of 25 and 10 nodes
+  model <- train(class ~., data = training, method = "nnet",
+                 trControl = trainControl("cv", number = 4),
+                 tuneGrid = expand.grid(size = c(15,7), decay = 0),
+                 trace = FALSE,MaxNWts = 2000)
+  n_mod<-values("Neural Network 2 hidden",9)
+  n_mod[1:2]
+  metrics <- rbind(metrics, n_mod)
+  
+  #Model 10 - SVM with lineal kernel function
+  model <- train(class ~., data = training, method = "svmLinear", 
+                 trControl = trainControl("cv", number = 10),
+                 verbose = FALSE)
+  n_mod<-values("SVM lineal",10)
+  metrics <- rbind(metrics, n_mod)
+  
+  #Model 11 - SVM with radial kernel function
+  model <- train(class ~., data = training, method = "svmRadial", 
+                 trControl = trainControl("cv", number = 10),
+                 verbose = FALSE)
+  n_mod<-values("SVM radial",11)
+  metrics <- rbind(metrics, n_mod)
+  
+  #Model 12 - Classification tree without boosting
+  model <- train(class ~., data = training, method = "rpart", 
+                 trControl = trainControl("cv", number = 10))
+  n_mod<-values("Class tree no boost",12)
+  metrics <- rbind(metrics, n_mod)
+  
+  #Model 13 - Classification tree with boosting
+  model <- train(class ~., data = training, method = "gbm", 
+                 trControl = trainControl("cv", number = 10),
+                 verbose = FALSE)
+  n_mod<-values("Class tree boost",13)
+  metrics <- rbind(metrics, n_mod)
+  
+  #Model 14 - Random Forest n=100
+  model <- train(class ~., data = training, method = "rf", 
+                 trControl = trainControl("cv", number = 10),
+                 ntree = 100, verbose = FALSE)
+  n_mod<-values("Random Forest n=100",14)
+  metrics <- rbind(metrics, n_mod)
+  
+  #Model 15 - Random Forest n=200
+  model <- train(class ~., data = training, method = "rf", 
+                 trControl = trainControl("cv", number = 10),
+                 ntree = 200, verbose = FALSE)
+  n_mod<-values("Random Forest n=200",15)
+  metrics <- rbind(metrics, n_mod)
+  metrics$accuracy <- round(as.numeric(metrics$accuracy),5)
+  metrics$p_value <- sprintf("%.5e", as.numeric(metrics$p_value),5)
+  metrics$p_value <- as.numeric(metrics$p_value)
+  metrics$kappa <- round(as.numeric(metrics$kappa),5)
+  metrics<-metrics[order(-metrics$accuracy), ]
+  return(metrics)
+}
+```
+
+```{r}
+excel<-function(cat, name){
+  save_data<-function(data,sheet,cat){
+    data$class<-cat
+    ranking<-ML(normalize(data))
+    addWorksheet(wb, sheetName = sheet)
+    writeData(wb, sheet = sheet, ranking)
+  }
+  wb <- createWorkbook()
+  save_data(dfm_mean,"Mean",cat)
+  save_data(dfm_median,"Median",cat)
+  save_data(dfm_energy,"energy",cat)
+  save_data(dfm_SE,"Entropy",cat)
+  
+  saveWorkbook(wb, file = name, overwrite = TRUE)
+}
+```
+
+```{r}
+excel(task,"class_task.xlsx")
+excel(qual,"class_quality count.xlsx")
+excel(sex,"class_sex.xlsx")
+```
